@@ -1,0 +1,12 @@
+{
+  "name": "@aerobeat/web-audio-testbed",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "demo": "echo \"Add a repo-local Vite or static demo command when scenes need serving.\"",
+    "serve": "echo \"Define host, port, cache busting, QR/link output, served roots, and secure-context handling before mobile validation.\"",
+    "test": "node --test test/*.test.js",
+    "test:browser": "echo \"Add Playwright browser tests when this repo owns browser-visible behavior.\""
+  }
+}
