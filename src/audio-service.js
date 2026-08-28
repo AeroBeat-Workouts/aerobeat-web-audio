@@ -386,7 +386,20 @@ export function createAeroWebAudioService(options = {}) {
       }
       const failure = normalizePlayFailure(cause);
       autoplayState = failure.code === "audio_autoplay_blocked" ? "blocked" : autoplayState;
+      clock.pause(contextTime());
+      stopPlaybackNode();
       setTerminalError(failure.code, failure.message);
+      if (audioContext.state !== "closed" && audioContext.state !== "suspended") {
+        try {
+          await audioContext.suspend();
+        } catch {
+          // The original play failure remains the actionable diagnostic.
+        }
+      }
+      if (isStale(currentGeneration, currentOperation)) {
+        await restoreAfterStaleSuspend();
+        return result(previousStatus, true);
+      }
       return result(previousStatus, false);
     }
   }
@@ -674,7 +687,12 @@ export function createAeroWebAudioService(options = {}) {
     if (!decodedBuffer || !audioContext?.createBufferSource) {
       return;
     }
-    const node = audioContext.createBufferSource();
+    let node;
+    try {
+      node = audioContext.createBufferSource();
+    } catch (cause) {
+      throw createAudioFailure("audio_context_failed", `Audio source node could not be created${diagnosticSuffix(cause)}`);
+    }
     playbackNode = node;
     node.buffer = decodedBuffer;
     node.onended = () => {

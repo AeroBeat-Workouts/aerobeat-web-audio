@@ -273,6 +273,53 @@ test("a late AudioContext resume completion cannot restart playback after pause"
   assert.equal(service.getClockSnapshot().positionSeconds, 0);
 });
 
+test("late resume cannot override newer hidden, lease-release, or source-replacement intent", async () => {
+  for (const transition of ["hidden", "lease-release", "source-replacement"]) {
+    /** @type {Parameters<typeof createFakeAudioContext>[0]} */
+    const contextOptions = {};
+    const audioContext = createFakeAudioContext(contextOptions);
+    const service = createAeroWebAudioService({ audioContext });
+    await service.load({ id: `resume-${transition}`, kind: "generated-silence", label: transition, durationSeconds: 10 });
+    await service.play();
+
+    const resumeDeferred = createDeferredVoid();
+    contextOptions.resumeDeferred = resumeDeferred;
+    let pendingResume;
+    if (transition === "hidden") {
+      await service.setDocumentHidden(true);
+      pendingResume = service.setDocumentHidden(false);
+      await Promise.resolve();
+      await service.setDocumentHidden(true);
+    } else if (transition === "lease-release") {
+      await service.pauseForLease();
+      pendingResume = service.activateLease();
+      await Promise.resolve();
+      await service.releaseLease();
+    } else {
+      await service.pause();
+      pendingResume = service.play();
+      await Promise.resolve();
+      await service.load({ id: "replacement", kind: "generated-silence", label: "Replacement", durationSeconds: 4 });
+    }
+    resumeDeferred.resolve();
+    const stale = await pendingResume;
+
+    assert.equal(stale.stale, true, transition);
+    assert.equal(service.getClockSnapshot().playing, false, transition);
+    assert.equal(audioContext.state, "suspended", transition);
+    if (transition === "hidden") {
+      assert.equal(service.getStatus().visibilityState, "hidden");
+      assert.equal(service.getStatus().state, "paused");
+    } else if (transition === "lease-release") {
+      assert.equal(service.getStatus().leaseState, "released");
+      assert.equal(service.getStatus().state, "paused");
+    } else {
+      assert.equal(service.getStatus().sourceId, "replacement");
+      assert.equal(service.getStatus().state, "ready");
+    }
+  }
+});
+
 test("failed decode remains unplayable and cannot advance the public clock", async () => {
   const audioContext = createFakeAudioContext({ decodeError: new DOMException("EncodingError") });
   const service = createAeroWebAudioService({ audioContext });
@@ -316,21 +363,35 @@ test("natural playback end disconnects its node once and remains stable through 
   assert.equal(node.disconnectCalls, 1, "destroy must not retire an already-ended node twice");
 });
 
-test("source-node start failure reports context truth and retires the partial node exactly once", async () => {
-  const audioContext = createFakeAudioContext({ startError: new DOMException("InvalidStateError") });
-  const service = createAeroWebAudioService({ audioContext });
-  await service.load(createArrayBufferSource("start-failure"));
-  const failed = await service.play();
-  const node = audioContext.createdNodes[0];
+test("source-node create, connect, and start failures report context truth without leaking partial nodes", async () => {
+  for (const phase of ["create", "connect", "start"]) {
+    const failure = new DOMException(`${phase} failed`, "InvalidStateError");
+    const audioContext = createFakeAudioContext({
+      createNodeError: phase === "create" ? failure : undefined,
+      connectError: phase === "connect" ? failure : undefined,
+      startError: phase === "start" ? failure : undefined
+    });
+    const service = createAeroWebAudioService({ audioContext });
+    await service.load(createArrayBufferSource(`${phase}-failure`));
+    const failed = await service.play();
+    const node = audioContext.createdNodes[0];
 
-  assert.equal(failed.status.state, "error");
-  assert.equal(failed.status.errorCode, "audio_context_failed");
-  assert.equal(service.getClockSnapshot().playing, false);
-  assert.equal(node?.stopCalls, 1);
-  assert.equal(node?.disconnectCalls, 1);
-  await service.destroy();
-  assert.equal(node?.stopCalls, 1);
-  assert.equal(node?.disconnectCalls, 1);
+    assert.equal(failed.status.state, "error", phase);
+    assert.equal(failed.status.errorCode, "audio_context_failed", phase);
+    assert.equal(service.getClockSnapshot().playing, false, phase);
+    assert.equal(audioContext.state, "suspended", `${phase} context must not remain running after failed playback`);
+    if (phase === "create") {
+      assert.equal(node, undefined);
+    } else {
+      assert.equal(node?.stopCalls, 1, phase);
+      assert.equal(node?.disconnectCalls, 1, phase);
+    }
+    await service.destroy();
+    if (node) {
+      assert.equal(node.stopCalls, 1, `${phase} destroy stop exactness`);
+      assert.equal(node.disconnectCalls, 1, `${phase} destroy disconnect exactness`);
+    }
+  }
 });
 
 test("newer playback intent wins when older pause, stop, visibility, or lease suspension settles late", async () => {
@@ -371,6 +432,29 @@ test("newer playback intent wins when older pause, stop, visibility, or lease su
     assert.equal(service.getClockSnapshot().playing, true, `${transition} clock must agree with state`);
     await service.destroy();
   }
+});
+
+test("lease release remains terminal when an older lease pause settles later", async () => {
+  const suspendDeferred = createDeferredVoid();
+  const audioContext = createFakeAudioContext({ suspendDeferred });
+  const service = createAeroWebAudioService({ audioContext });
+  await service.load(createArrayBufferSource("lease-release-race"));
+  await service.play();
+  audioContext.advance(2);
+
+  const pendingPause = service.pauseForLease();
+  await Promise.resolve();
+  const pendingRelease = service.releaseLease();
+  await Promise.resolve();
+  suspendDeferred.resolve();
+  await pendingPause;
+  await pendingRelease;
+
+  assert.equal(service.getStatus().leaseState, "released");
+  assert.equal(service.getStatus().state, "paused");
+  assert.equal(service.getClockSnapshot().playing, false);
+  assert.equal(service.getClockSnapshot().positionSeconds, 2);
+  assert.equal(audioContext.state, "suspended");
 });
 
 test("pause, visibility, and lease changes do not discard the current pending decode", async () => {
@@ -441,6 +525,41 @@ test("per-instance services isolate clocks, nodes, sources, and teardown", async
   assert.equal(first.getStatus().state, "destroyed");
   assert.equal(second.getStatus().state, "ready");
   assert.equal(secondContext.createdNodes.length, 0);
+});
+
+test("newer source generations supersede late hash and decode completion", async () => {
+  for (const phase of ["hash", "decode"]) {
+    const hashDeferred = createDeferredHash();
+    const decodeDeferred = createDeferredDecode();
+    const audioContext = createFakeAudioContext({ decodeDeferred: phase === "decode" ? decodeDeferred : undefined });
+    const service = createAeroWebAudioService({
+      audioContext,
+      hashBytes: phase === "hash" ? async () => hashDeferred.promise : async () => SHA_256_A
+    });
+    const first = service.load({
+      ...createArrayBufferSource(`late-${phase}`),
+      expectedHash: { algorithm: "SHA-256", value: SHA_256_A }
+    });
+    await Promise.resolve();
+    const current = await service.load({
+      id: `current-${phase}`,
+      kind: "generated-silence",
+      label: `Current ${phase}`,
+      durationSeconds: 8
+    });
+    if (phase === "hash") {
+      hashDeferred.resolve(SHA_256_A);
+    } else {
+      decodeDeferred.resolve({ duration: 20 });
+    }
+    const stale = await first;
+
+    assert.equal(current.status.sourceId, `current-${phase}`);
+    assert.equal(stale.stale, true, phase);
+    assert.equal(service.getStatus().sourceId, `current-${phase}`);
+    assert.equal(service.getStatus().state, "ready");
+    assert.equal(service.getStatus().durationSeconds, 8);
+  }
 });
 
 test("a newer load aborts and supersedes late fetch completion", async () => {
@@ -565,7 +684,7 @@ function createUrlSource(id, url) {
  */
 
 /**
- * @param {{ decodedDurationSeconds?: number, resumeError?: Error, resumeDeferred?: ReturnType<typeof createDeferredVoid>, suspendDeferred?: ReturnType<typeof createDeferredVoid>, decodeError?: Error, decodeDeferred?: ReturnType<typeof createDeferredDecode>, startError?: Error }} [options]
+ * @param {{ decodedDurationSeconds?: number, resumeError?: Error, resumeDeferred?: ReturnType<typeof createDeferredVoid>, suspendDeferred?: ReturnType<typeof createDeferredVoid>, decodeError?: Error, decodeDeferred?: ReturnType<typeof createDeferredDecode>, createNodeError?: Error, connectError?: Error, startError?: Error }} [options]
  * @returns {FakeAudioContext}
  */
 function createFakeAudioContext(options = {}) {
@@ -622,6 +741,9 @@ function createFakeAudioContext(options = {}) {
       return { duration: options.decodedDurationSeconds ?? 30 };
     },
     createBufferSource() {
+      if (options.createNodeError) {
+        throw options.createNodeError;
+      }
       /** @type {FakeBufferSource} */
       const node = {
         buffer: null,
@@ -632,7 +754,11 @@ function createFakeAudioContext(options = {}) {
         stopCalls: 0,
         disconnectCalls: 0,
         offset: 0,
-        connect() {},
+        connect() {
+          if (options.connectError) {
+            throw options.connectError;
+          }
+        },
         start(_when = 0, offset = 0) {
           if (options.startError) {
             throw options.startError;
@@ -718,6 +844,18 @@ function createDeferredResponse() {
       return signal;
     }
   };
+}
+
+/**
+ * @returns {{ promise: Promise<string>, resolve: (digest: string) => void }}
+ */
+function createDeferredHash() {
+  /** @type {(digest: string) => void} */
+  let resolveHash = () => {};
+  const promise = new Promise(resolve => {
+    resolveHash = resolve;
+  });
+  return { promise, resolve: resolveHash };
 }
 
 /**
