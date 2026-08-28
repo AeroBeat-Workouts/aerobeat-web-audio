@@ -42,4 +42,4 @@ if (failures.length > 0) {
   process.exit(1);
 }
 
-console.log("JSDoc/no-escape placeholder check passed.");
+console.log("JSDoc/no-escape validation passed.");

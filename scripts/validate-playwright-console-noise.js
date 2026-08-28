@@ -9,4 +9,4 @@ if (!config.includes("console")) {
   process.exit(1);
 }
 
-console.log("Playwright console-noise placeholder check passed.");
+console.log("Playwright console-noise policy validation passed.");

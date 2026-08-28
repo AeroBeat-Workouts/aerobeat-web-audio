@@ -41,4 +41,4 @@ if (failures.length > 0) {
   process.exit(1);
 }
 
-console.log("Public import-boundary placeholder check passed.");
+console.log("Public import-boundary validation passed.");

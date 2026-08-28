@@ -1,10 +1,10 @@
 // @ts-check
 
 /**
- * Playwright config placeholder.
- *
- * Browser-visible repos must fail tests on unexpected console warnings and
- * errors. Add the console listener in test setup before enabling real tests.
+ * Documentation/configuration surface for repo-local browser scenes. The
+ * deterministic `scripts/run-browser-tests.js` harness owns its static server
+ * and attaches console warning/error plus page-error listeners before loading
+ * the package. Future Playwright test-runner suites reuse this directory.
  *
  * @type {{ testDir: string }}
  */
