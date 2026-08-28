@@ -206,6 +206,19 @@ test("hash mismatch and unavailable hashing are distinct failures", async () => 
     expectedHash: { algorithm: "SHA-256", value: SHA_256_A }
   });
   assert.equal(unavailable.status.errorCode, "audio_hash_unavailable");
+
+  const rejectedService = createAeroWebAudioService({
+    audioContext: createFakeAudioContext(),
+    hashBytes: async () => {
+      throw new DOMException("SubtleCrypto unavailable", "NotSupportedError");
+    }
+  });
+  const rejected = await rejectedService.load({
+    ...createArrayBufferSource("hash-rejected"),
+    expectedHash: { algorithm: "SHA-256", value: SHA_256_A }
+  });
+  assert.equal(rejected.status.errorCode, "audio_hash_unavailable");
+  assert.match(rejected.status.errorMessage ?? "", /verification failed/u);
 });
 
 test("decode failure reports unsupported encoded codec without trusting .egg extension", async () => {
@@ -258,6 +271,176 @@ test("a late AudioContext resume completion cannot restart playback after pause"
   assert.equal(audioContext.state, "suspended");
   audioContext.advance(5);
   assert.equal(service.getClockSnapshot().positionSeconds, 0);
+});
+
+test("failed decode remains unplayable and cannot advance the public clock", async () => {
+  const audioContext = createFakeAudioContext({ decodeError: new DOMException("EncodingError") });
+  const service = createAeroWebAudioService({ audioContext });
+  const failed = await service.load(createArrayBufferSource("failed-decode"));
+
+  assert.equal(failed.status.state, "error");
+  assert.equal(failed.status.errorCode, "audio_decode_failed");
+  const denied = await service.play();
+  audioContext.advance(5);
+  assert.equal(denied.status.state, "error");
+  assert.equal(denied.status.errorCode, "audio_decode_failed");
+  assert.equal(service.getClockSnapshot().playing, false);
+  assert.equal(service.getClockSnapshot().positionSeconds, 0);
+  assert.equal(audioContext.createdNodes.length, 0);
+
+  await service.pause();
+  await service.stop();
+  await service.seek(4);
+  assert.equal(service.getStatus().state, "error");
+  assert.equal(service.getStatus().errorCode, "audio_decode_failed", "transport controls must not erase load-failure truth");
+  assert.equal(service.getClockSnapshot().positionSeconds, 0);
+});
+
+test("natural playback end disconnects its node once and remains stable through destroy", async () => {
+  const audioContext = createFakeAudioContext({ decodedDurationSeconds: 10 });
+  const service = createAeroWebAudioService({ audioContext });
+  await service.load(createArrayBufferSource("natural-end"));
+  await service.play();
+  const node = audioContext.createdNodes[0];
+  assert.ok(node?.onended);
+
+  node.onended?.();
+  assert.equal(service.getStatus().state, "stopped");
+  assert.equal(service.getClockSnapshot().positionSeconds, 10);
+  assert.equal(service.getClockSnapshot().playing, false);
+  assert.equal(node.stopCalls, 0, "a naturally ended one-shot node is already stopped by the browser");
+  assert.equal(node.disconnectCalls, 1);
+
+  await service.destroy();
+  assert.equal(node.stopCalls, 0);
+  assert.equal(node.disconnectCalls, 1, "destroy must not retire an already-ended node twice");
+});
+
+test("source-node start failure reports context truth and retires the partial node exactly once", async () => {
+  const audioContext = createFakeAudioContext({ startError: new DOMException("InvalidStateError") });
+  const service = createAeroWebAudioService({ audioContext });
+  await service.load(createArrayBufferSource("start-failure"));
+  const failed = await service.play();
+  const node = audioContext.createdNodes[0];
+
+  assert.equal(failed.status.state, "error");
+  assert.equal(failed.status.errorCode, "audio_context_failed");
+  assert.equal(service.getClockSnapshot().playing, false);
+  assert.equal(node?.stopCalls, 1);
+  assert.equal(node?.disconnectCalls, 1);
+  await service.destroy();
+  assert.equal(node?.stopCalls, 1);
+  assert.equal(node?.disconnectCalls, 1);
+});
+
+test("newer playback intent wins when older pause, stop, visibility, or lease suspension settles late", async () => {
+  for (const transition of ["pause", "stop", "visibility", "lease"]) {
+    const suspendDeferred = createDeferredVoid();
+    const audioContext = createFakeAudioContext({ suspendDeferred });
+    const service = createAeroWebAudioService({ audioContext });
+    await service.load(createArrayBufferSource(`race-${transition}`));
+    await service.play();
+
+    let pendingTransition;
+    let newerPlay;
+    if (transition === "pause") {
+      pendingTransition = service.pause();
+      await Promise.resolve();
+      newerPlay = service.play();
+    } else if (transition === "stop") {
+      pendingTransition = service.stop();
+      await Promise.resolve();
+      newerPlay = service.play();
+    } else if (transition === "visibility") {
+      pendingTransition = service.setDocumentHidden(true);
+      await Promise.resolve();
+      newerPlay = service.setDocumentHidden(false);
+    } else {
+      pendingTransition = service.pauseForLease();
+      await Promise.resolve();
+      newerPlay = service.activateLease();
+    }
+
+    await Promise.resolve();
+    suspendDeferred.resolve();
+    const staleTransition = await pendingTransition;
+    await newerPlay;
+    assert.equal(staleTransition.stale, transition === "stop", `${transition} stale result truth`);
+    assert.equal(service.getStatus().state, "playing", `${transition} must not override newer play`);
+    assert.equal(audioContext.state, "running", `${transition} must not leave context suspended`);
+    assert.equal(service.getClockSnapshot().playing, true, `${transition} clock must agree with state`);
+    await service.destroy();
+  }
+});
+
+test("pause, visibility, and lease changes do not discard the current pending decode", async () => {
+  for (const transition of ["pause", "visibility", "lease"]) {
+    const decodeDeferred = createDeferredDecode();
+    const audioContext = createFakeAudioContext({ decodeDeferred });
+    const service = createAeroWebAudioService({ audioContext });
+    const pendingLoad = service.load(createArrayBufferSource(`pending-${transition}`));
+    await Promise.resolve();
+
+    if (transition === "pause") {
+      await service.pause();
+    } else if (transition === "visibility") {
+      await service.setDocumentHidden(true);
+    } else {
+      await service.pauseForLease();
+    }
+    decodeDeferred.resolve({ duration: 12 });
+    const loaded = await pendingLoad;
+
+    assert.equal(loaded.stale, false, `${transition} must not supersede the source generation`);
+    assert.equal(service.getStatus().state, "ready");
+    assert.equal(service.getStatus().durationSeconds, 12);
+    assert.equal(audioContext.decodeCalls, 1);
+    if (transition === "visibility") {
+      assert.equal(service.getStatus().visibilityState, "hidden");
+    }
+    if (transition === "lease") {
+      assert.equal(service.getStatus().leaseState, "inactive");
+    }
+    await service.destroy();
+  }
+});
+
+test("caller cancellation during decode remains explicit and leaves no playable clock", async () => {
+  const decodeDeferred = createDeferredDecode();
+  const audioContext = createFakeAudioContext({ decodeDeferred });
+  const service = createAeroWebAudioService({ audioContext });
+  const controller = new AbortController();
+  const pending = service.load(createArrayBufferSource("caller-abort"), { signal: controller.signal });
+  await Promise.resolve();
+  controller.abort();
+  decodeDeferred.resolve({ duration: 20 });
+  const cancelled = await pending;
+
+  assert.equal(cancelled.stale, false);
+  assert.equal(cancelled.status.state, "error");
+  assert.equal(cancelled.status.errorCode, "audio_operation_aborted");
+  assert.equal(service.getClockSnapshot().playing, false);
+  assert.equal((await service.play()).status.errorCode, "audio_operation_aborted");
+});
+
+test("per-instance services isolate clocks, nodes, sources, and teardown", async () => {
+  const firstContext = createFakeAudioContext({ decodedDurationSeconds: 30 });
+  const secondContext = createFakeAudioContext({ decodedDurationSeconds: 60 });
+  const first = createAeroWebAudioService({ audioContext: firstContext });
+  const second = createAeroWebAudioService({ audioContext: secondContext });
+  await first.load(createArrayBufferSource("first"));
+  await second.load(createArrayBufferSource("second"));
+  await first.play();
+  firstContext.advance(3);
+
+  assert.equal(first.getClockSnapshot().positionSeconds, 3);
+  assert.equal(second.getClockSnapshot().positionSeconds, 0);
+  assert.equal(first.getSource()?.id, "first");
+  assert.equal(second.getSource()?.id, "second");
+  await first.destroy();
+  assert.equal(first.getStatus().state, "destroyed");
+  assert.equal(second.getStatus().state, "ready");
+  assert.equal(secondContext.createdNodes.length, 0);
 });
 
 test("a newer load aborts and supersedes late fetch completion", async () => {
@@ -375,12 +558,14 @@ function createUrlSource(id, url) {
  *   started: boolean,
  *   stopped: boolean,
  *   disconnected: boolean,
+ *   stopCalls: number,
+ *   disconnectCalls: number,
  *   offset: number
  * }} FakeBufferSource
  */
 
 /**
- * @param {{ decodedDurationSeconds?: number, resumeError?: Error, resumeDeferred?: ReturnType<typeof createDeferredVoid>, decodeError?: Error, decodeDeferred?: ReturnType<typeof createDeferredDecode> }} [options]
+ * @param {{ decodedDurationSeconds?: number, resumeError?: Error, resumeDeferred?: ReturnType<typeof createDeferredVoid>, suspendDeferred?: ReturnType<typeof createDeferredVoid>, decodeError?: Error, decodeDeferred?: ReturnType<typeof createDeferredDecode>, startError?: Error }} [options]
  * @returns {FakeAudioContext}
  */
 function createFakeAudioContext(options = {}) {
@@ -417,6 +602,9 @@ function createFakeAudioContext(options = {}) {
       state = "running";
     },
     async suspend() {
+      if (options.suspendDeferred) {
+        await options.suspendDeferred.promise;
+      }
       state = "suspended";
     },
     async close() {
@@ -441,16 +629,23 @@ function createFakeAudioContext(options = {}) {
         started: false,
         stopped: false,
         disconnected: false,
+        stopCalls: 0,
+        disconnectCalls: 0,
         offset: 0,
         connect() {},
         start(_when = 0, offset = 0) {
+          if (options.startError) {
+            throw options.startError;
+          }
           node.started = true;
           node.offset = offset;
         },
         stop() {
+          node.stopCalls += 1;
           node.stopped = true;
         },
         disconnect() {
+          node.disconnectCalls += 1;
           node.disconnected = true;
         }
       };

@@ -260,7 +260,7 @@ export function createAeroWebAudioService(options = {}) {
 
     const descriptor = createAudioSourceDescriptor(sourceInput);
     const currentGeneration = ++generation;
-    const currentOperation = ++operationId;
+    ++operationId;
     loadController?.abort();
     const linked = createLinkedAbortController(loadOptions.signal);
     loadController = linked.controller;
@@ -279,13 +279,15 @@ export function createAeroWebAudioService(options = {}) {
         return result(previousStatus, false);
       }
       const bytes = await resolveEncodedBytes(sourceInput, descriptor, linked.controller.signal);
-      if (isStale(currentGeneration, currentOperation)) {
+      if (isGenerationStale(currentGeneration)) {
         return result(previousStatus, true);
       }
+      throwIfAborted(linked.controller.signal);
       await verifyExpectedHash(bytes, descriptor);
-      if (isStale(currentGeneration, currentOperation)) {
+      if (isGenerationStale(currentGeneration)) {
         return result(previousStatus, true);
       }
+      throwIfAborted(linked.controller.signal);
       if (!audioContext.decodeAudioData) {
         throw createAudioFailure("audio_decode_unsupported", "This Web Audio context cannot decode encoded audio bytes");
       }
@@ -295,9 +297,10 @@ export function createAeroWebAudioService(options = {}) {
       } catch (decodeCause) {
         throw createAudioFailure("audio_decode_failed", `Browser audio decode failed; file extensions such as .egg do not guarantee codec support${diagnosticSuffix(decodeCause)}`);
       }
-      if (isStale(currentGeneration, currentOperation)) {
+      if (isGenerationStale(currentGeneration)) {
         return result(previousStatus, true);
       }
+      throwIfAborted(linked.controller.signal);
       decodedBuffer = nextBuffer;
       source = Object.freeze({ ...descriptor, durationSeconds: normalizeDecodedDuration(nextBuffer.duration, descriptor.durationSeconds) });
       clock = createPlaybackClock({ durationSeconds: source.durationSeconds });
@@ -305,7 +308,7 @@ export function createAeroWebAudioService(options = {}) {
       error = undefined;
       return result(previousStatus, false);
     } catch (cause) {
-      if (isStale(currentGeneration, currentOperation)) {
+      if (isGenerationStale(currentGeneration)) {
         return result(previousStatus, true);
       }
       const failure = normalizeFailure(cause, linked.controller.signal.aborted);
@@ -336,6 +339,12 @@ export function createAeroWebAudioService(options = {}) {
     }
     if (!source || state === "loading") {
       setTerminalError("audio_source_missing", state === "loading" ? "Audio source is still loading" : "No audio source loaded");
+      return result(previousStatus, false);
+    }
+    if (!hasPlayableSource()) {
+      if (state !== "error" || !error) {
+        setTerminalError("audio_source_missing", "The audio source has not decoded into a playable buffer");
+      }
       return result(previousStatus, false);
     }
     if (leaseState !== "active") {
@@ -382,6 +391,11 @@ export function createAeroWebAudioService(options = {}) {
     }
   }
 
+  /** @returns {boolean} */
+  function hasPlayableSource() {
+    return Boolean(source && (source.kind === "generated-silence" || decodedBuffer));
+  }
+
   /** @returns {Promise<AudioOperationResult>} */
   async function pause() {
     const previousStatus = getStatus();
@@ -396,42 +410,61 @@ export function createAeroWebAudioService(options = {}) {
    * @returns {Promise<void>}
    */
   async function pauseInternal(nextState) {
-    ++operationId;
+    const currentOperation = ++operationId;
+    const currentGeneration = generation;
     if (!audioContext || destroyed) {
       return;
     }
+    const preserveLoadFailure = state === "error" && !hasPlayableSource();
     clock.pause(contextTime());
     stopPlaybackNode();
+    if (!preserveLoadFailure) {
+      state = source ? nextState : "idle";
+      error = undefined;
+    }
     if (audioContext.state !== "closed") {
       try {
         await audioContext.suspend();
       } catch (cause) {
-        setTerminalError("audio_context_failed", `AudioContext suspend failed${diagnosticSuffix(cause)}`);
+        if (!isStale(currentGeneration, currentOperation)) {
+          setTerminalError("audio_context_failed", `AudioContext suspend failed${diagnosticSuffix(cause)}`);
+        }
         return;
       }
     }
-    state = source ? nextState : "idle";
-    error = undefined;
+    if (isStale(currentGeneration, currentOperation)) {
+      await restoreAfterStaleSuspend();
+    }
   }
 
   /** @returns {Promise<AudioOperationResult>} */
   async function stop() {
     const previousStatus = getStatus();
-    ++operationId;
+    const currentOperation = ++operationId;
+    const currentGeneration = generation;
+    const preserveLoadFailure = state === "error" && !hasPlayableSource();
     clock.stop();
     stopPlaybackNode();
+    if (!preserveLoadFailure) {
+      state = source ? "stopped" : audioContext ? "idle" : "unsupported";
+      error = undefined;
+    }
+    resumeAfterLease = false;
+    resumeAfterVisibility = false;
     if (audioContext && !destroyed && audioContext.state !== "closed") {
       try {
         await audioContext.suspend();
       } catch (cause) {
-        setTerminalError("audio_context_failed", `AudioContext suspend failed${diagnosticSuffix(cause)}`);
-        return result(previousStatus, false);
+        if (!isStale(currentGeneration, currentOperation)) {
+          setTerminalError("audio_context_failed", `AudioContext suspend failed${diagnosticSuffix(cause)}`);
+        }
+        return result(previousStatus, isStale(currentGeneration, currentOperation));
       }
     }
-    state = source ? "stopped" : audioContext ? "idle" : "unsupported";
-    error = undefined;
-    resumeAfterLease = false;
-    resumeAfterVisibility = false;
+    if (isStale(currentGeneration, currentOperation)) {
+      await restoreAfterStaleSuspend();
+      return result(previousStatus, true);
+    }
     return result(previousStatus, false);
   }
 
@@ -445,15 +478,27 @@ export function createAeroWebAudioService(options = {}) {
       setTerminalError("audio_destroyed", "Audio service is destroyed");
       return result(previousStatus, false);
     }
+    if (!source || !hasPlayableSource()) {
+      if (state !== "error" || !error) {
+        setTerminalError("audio_source_missing", source ? "The audio source has not decoded into a seekable buffer" : "No audio source loaded");
+      }
+      return result(previousStatus, false);
+    }
     const wasPlaying = state === "playing";
     const safePosition = normalizePosition(positionSeconds, source?.durationSeconds);
     ++operationId;
     stopPlaybackNode();
     clock.seek(safePosition, contextTime());
     if (wasPlaying && audioContext) {
-      startPlaybackNode(safePosition, generation);
-      clock.start(contextTime());
-      state = "playing";
+      try {
+        startPlaybackNode(safePosition, generation);
+        clock.start(contextTime());
+        state = "playing";
+      } catch (cause) {
+        const failure = normalizeFailure(cause, false);
+        setTerminalError(failure.code, failure.message);
+        return result(previousStatus, false);
+      }
     } else if (source) {
       state = "paused";
     }
@@ -609,7 +654,12 @@ export function createAeroWebAudioService(options = {}) {
     if (!hashBytes) {
       throw createAudioFailure("audio_hash_unavailable", "SHA-256 verification is unavailable in this browser context");
     }
-    const actual = (await hashBytes(bytes, descriptor.expectedHash.algorithm)).toLowerCase();
+    let actual;
+    try {
+      actual = (await hashBytes(bytes, descriptor.expectedHash.algorithm)).toLowerCase();
+    } catch (cause) {
+      throw createAudioFailure("audio_hash_unavailable", `SHA-256 verification failed in this browser context${diagnosticSuffix(cause)}`);
+    }
     if (actual !== descriptor.expectedHash.value) {
       throw createAudioFailure("audio_hash_mismatch", `Audio SHA-256 mismatch: expected ${descriptor.expectedHash.value}, received ${actual}`);
     }
@@ -625,21 +675,30 @@ export function createAeroWebAudioService(options = {}) {
       return;
     }
     const node = audioContext.createBufferSource();
+    playbackNode = node;
     node.buffer = decodedBuffer;
-    if (audioContext.destination !== undefined) {
-      node.connect(audioContext.destination);
-    }
     node.onended = () => {
       if (node !== playbackNode || nodeGeneration !== generation || state !== "playing") {
         return;
       }
       playbackNode = undefined;
+      node.onended = null;
+      disconnectPlaybackNode(node);
       clock.seek(source?.durationSeconds ?? decodedBuffer?.duration ?? offsetSeconds, contextTime());
       clock.pause(contextTime());
       state = "stopped";
     };
-    node.start(0, offsetSeconds);
-    playbackNode = node;
+    try {
+      if (audioContext.destination !== undefined) {
+        node.connect(audioContext.destination);
+      }
+      node.start(0, offsetSeconds);
+    } catch (cause) {
+      playbackNode = undefined;
+      node.onended = null;
+      stopAndDisconnectPlaybackNode(node);
+      throw createAudioFailure("audio_context_failed", `Audio source node could not start${diagnosticSuffix(cause)}`);
+    }
   }
 
   function stopPlaybackNode() {
@@ -649,11 +708,21 @@ export function createAeroWebAudioService(options = {}) {
       return;
     }
     node.onended = null;
+    stopAndDisconnectPlaybackNode(node);
+  }
+
+  /** @param {AudioBufferSourceNodeAdapter} node */
+  function stopAndDisconnectPlaybackNode(node) {
     try {
       node.stop();
     } catch {
       // A source that never started or already ended is still safe to disconnect.
     }
+    disconnectPlaybackNode(node);
+  }
+
+  /** @param {AudioBufferSourceNodeAdapter} node */
+  function disconnectPlaybackNode(node) {
     try {
       node.disconnect();
     } catch {
@@ -674,7 +743,19 @@ export function createAeroWebAudioService(options = {}) {
    * @returns {boolean}
    */
   function isStale(currentGeneration, currentOperation) {
-    return destroyed || generation !== currentGeneration || operationId !== currentOperation;
+    return isGenerationStale(currentGeneration) || operationId !== currentOperation;
+  }
+
+  /** @param {number} currentGeneration @returns {boolean} */
+  function isGenerationStale(currentGeneration) {
+    return destroyed || generation !== currentGeneration;
+  }
+
+  /** @param {AbortSignal} signal */
+  function throwIfAborted(signal) {
+    if (signal.aborted) {
+      throw createAbortFailure();
+    }
   }
 
   /**
@@ -691,6 +772,29 @@ export function createAeroWebAudioService(options = {}) {
       await audioContext.suspend();
     } catch {
       // A newer lifecycle operation owns any subsequent context diagnostic.
+    }
+  }
+
+  /**
+   * A stale suspend may settle after a newer play intent has already started.
+   * Restore the context only while that newer intent remains current.
+   *
+   * @returns {Promise<void>}
+   */
+  async function restoreAfterStaleSuspend() {
+    if (destroyed || state !== "playing" || !audioContext || audioContext.state === "closed" || audioContext.state === "running") {
+      return;
+    }
+    const restoreGeneration = generation;
+    const restoreOperation = operationId;
+    try {
+      await audioContext.resume();
+    } catch (cause) {
+      if (!isStale(restoreGeneration, restoreOperation) && state === "playing") {
+        clock.pause(contextTime());
+        stopPlaybackNode();
+        setTerminalError("audio_context_failed", `AudioContext resume after stale suspend failed${diagnosticSuffix(cause)}`);
+      }
     }
   }
 

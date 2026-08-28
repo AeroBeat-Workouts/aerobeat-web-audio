@@ -16,7 +16,7 @@ Browser `decodeAudioData` determines codec support. Filename suffixes, including
 
 ## Generation and teardown
 
-Every load starts a new generation and aborts the prior fetch. Decode and context-resume operations cannot always be physically cancelled, so late completion checks both generation and operation identity before mutating state. Destroy invalidates both identities before releasing resources.
+Every load starts a new source generation and aborts the prior fetch. Fetch/hash/decode completion is gated by that source generation plus caller cancellation, so pausing, hiding, or transferring the lease does not accidentally discard the current decode. Playback resume/suspend transitions use a separate operation identity so newer user, visibility, lease, or source intent wins when browser promises settle out of order. Destroy invalidates both identities before releasing resources.
 
 `destroy()` synchronously marks the instance terminal, aborts active work, removes visibility listeners, stops/disconnects nodes, revokes service-owned object URLs, and clears source/buffer references. It then awaits closure of a service-owned AudioContext. Injected contexts are caller-owned and are never closed.
 
@@ -28,4 +28,6 @@ A destroyed service is not revived. Reconnection creates a fresh service instanc
 - Assembly can transfer a lease without reaching into audio internals.
 - Visibility resume retains memory for decoded audio but avoids re-fetch/re-decode drift.
 - Autoplay rejection can recur after resume and is surfaced as capability/error truth.
+- A fetch/hash/decode failure remains unplayable and retains its diagnostic until a replacement load or destruction; transport controls cannot turn a failed source into a silent advancing clock.
+- One-shot source nodes are stopped/disconnected exactly once on replacement or teardown, while naturally ended nodes are disconnected without an invalid second stop.
 - Product content policy, persistent caches, and external provider acquisition stay outside this package.
