@@ -41,8 +41,9 @@ test("mix API accepts only exact bounded own data values and remains private on 
   assert.deepEqual(service.setMix(nullPrototype), { musicVolume: 0, sfxVolume: 1 });
   assert.deepEqual(service.getMixSnapshot(), { musicVolume: 0, sfxVolume: 1 });
 
+  let accessorCalls = 0;
   const accessor = Object.defineProperties({}, {
-    musicVolume: { enumerable: true, get: () => 0.5 },
+    musicVolume: { enumerable: true, get() { accessorCalls += 1; return 0.5; } },
     sfxVolume: { enumerable: true, value: 0.5 }
   });
   const nonEnumerable = Object.defineProperties({}, {
@@ -56,6 +57,7 @@ test("mix API accepts only exact bounded own data values and remains private on 
   for (const value of invalidShape) {
     assert.throws(() => service.setMix(/** @type {import("@aerobeat/web-audio").AudioMixSnapshot} */ (value)), TypeError);
   }
+  assert.equal(accessorCalls, 0, "strict mix narrowing cannot invoke hostile accessors");
   for (const value of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
     assert.throws(() => service.setMix({ musicVolume: value, sfxVolume: 0.5 }), TypeError);
     assert.throws(() => service.setMix({ musicVolume: 0.5, sfxVolume: value }), TypeError);

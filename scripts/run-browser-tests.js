@@ -187,17 +187,52 @@ try {
   }
   const realGain = await page.evaluate(async modulePath => {
     const { createAeroWebAudioService } = /** @type {typeof import("../src/index.js")} */ (await import(modulePath));
-    const service = createAeroWebAudioService();
+    const audioContext = new AudioContext();
+    const createGain = audioContext.createGain.bind(audioContext);
+    /** @type {GainNode[]} */
+    const gainNodes = [];
+    /** @type {boolean[][]} */
+    const gainConnections = [];
+    /** @type {number[]} */
+    const gainDisconnectCalls = [];
+    Object.defineProperty(audioContext, "createGain", { value: () => {
+      const node = createGain();
+      const index = gainNodes.length;
+      const connect = node.connect.bind(node);
+      const disconnect = node.disconnect.bind(node);
+      gainNodes.push(node);
+      gainConnections.push([]);
+      gainDisconnectCalls.push(0);
+      Object.defineProperty(node, "connect", { value: (target) => {
+        gainConnections[index].push(target === audioContext.destination);
+        return connect(target);
+      } });
+      Object.defineProperty(node, "disconnect", { value: () => {
+        gainDisconnectCalls[index] += 1;
+        return disconnect();
+      } });
+      return node;
+    } });
+    const service = createAeroWebAudioService({ audioContext: /** @type {import("../src/index.js").AudioContextAdapter} */ (/** @type {unknown} */ (audioContext)) });
+    const defaults = service.getMixSnapshot();
     const evidence = {
       supported: service.getStatus().supported,
       gainBuses: service.getCapabilities().gainBuses,
+      defaults,
+      frozen: Object.isFrozen(defaults),
+      createdGainCount: gainNodes.length,
+      initialGainValues: gainNodes.map(node => node.gain.value),
+      gainConnections,
       applied: service.setMix({ musicVolume: 0, sfxVolume: 1 }),
+      appliedGainValues: gainNodes.map(node => node.gain.value),
       statusKeys: Object.keys(service.getStatus())
     };
     await service.destroy();
-    return evidence;
+    const teardown = { gainDisconnectCalls, callerContextState: audioContext.state };
+    await audioContext.close();
+    return { ...evidence, ...teardown };
   }, "/src/index.js");
-  if (!realGain.supported || !realGain.gainBuses || JSON.stringify(realGain.applied) !== JSON.stringify({ musicVolume: 0, sfxVolume: 1 }) || realGain.statusKeys.includes("musicVolume") || realGain.statusKeys.includes("sfxVolume")) {
+  if (!realGain.supported || !realGain.gainBuses || !realGain.frozen || realGain.createdGainCount !== 2 || JSON.stringify(realGain.defaults) !== JSON.stringify({ musicVolume: 0.5, sfxVolume: 0.5 }) || JSON.stringify(realGain.initialGainValues) !== JSON.stringify([0.5, 0.5]) || JSON.stringify(realGain.applied) !== JSON.stringify({ musicVolume: 0, sfxVolume: 1 }) || JSON.stringify(realGain.appliedGainValues) !== JSON.stringify([0, 1]) || !realGain.gainConnections.every(connections => connections.length === 1 && connections[0]) || realGain.gainDisconnectCalls.some(calls => calls !== 1) || realGain.callerContextState === "closed" || realGain.statusKeys.includes("musicVolume") || realGain.statusKeys.includes("sfxVolume")) {
     throw new Error(`Real browser GainNode/private mix proof failed: ${JSON.stringify(realGain)}`);
   }
   if (consoleFailures.length > 0) {
