@@ -8,6 +8,7 @@ This package owns browser audio resources for one connected game instance:
 
 - encoded audio fetch, byte intake, optional SHA-256 verification, and browser decode;
 - one-shot `AudioBufferSourceNode` recreation across play, pause, and seek;
+- service-owned Music and reserved future-SFX gain buses with strict bounded mix control;
 - deterministic gameplay-clock snapshots based on `AudioContext.currentTime`;
 - autoplay/suspended-context capability and failure truth;
 - hidden-document pause/resume while retaining decoded buffers;
@@ -25,7 +26,9 @@ It does not own gameplay judgement, chart/content policy, CV, rendering, UI, cro
 - `createAeroWebAudioService(options)`;
 - `createAudioSourceDescriptor(input)` and `audioSourceKinds`;
 - `createPlaybackClock()`, `createSongTimeline()`, `secondsToBeat()`, and `beatToSeconds()`;
-- strict JSDoc shapes for service options, statuses, capabilities, errors, source metadata, adapters, and timeline snapshots.
+- strict JSDoc shapes for service options, statuses, capabilities, errors, mix values, source metadata, adapters, and timeline snapshots.
+
+`createAeroWebAudioService()` exposes exact `getMixSnapshot()` and `setMix({ musicVolume, sfxVolume })` methods. Both values default to `0.5`, accept only finite numbers from `0` through `1`, and apply immediately without restarting playback or changing clock authority. Music sources route through the Music gain bus; the connected SFX bus is reserved for future sources. Contexts without `createGain()` retain the same private scalar API and existing direct-playback fallback while reporting `gainBuses: false` through capabilities. Mix values never enter general service status or capability telemetry; only the direct mix methods return them.
 
 The service supports `url`, `object-url`, `blob`, `array-buffer`, and deterministic `generated-silence` sources. Loaded source metadata never exposes encoded `ArrayBuffer` or `Blob` payloads.
 

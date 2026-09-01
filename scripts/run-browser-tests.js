@@ -110,10 +110,100 @@ try {
   if (lifecycle.finalState !== "destroyed" || lifecycle.externalCloseCalls !== 0) {
     throw new Error(`Browser teardown ownership failed: ${JSON.stringify(lifecycle)}`);
   }
+
+  const mixTopology = await page.evaluate(async modulePath => {
+    const { createAeroWebAudioService } = /** @type {typeof import("../src/index.js")} */ (await import(modulePath));
+    const destination = Object.freeze({ id: "destination" });
+    let currentTime = 0;
+    let contextState = "running";
+    let closeCalls = 0;
+    const gainNodes = [];
+    const sourceNodes = [];
+    const audioContext = {
+      destination,
+      get currentTime() { return currentTime; },
+      get state() { return contextState; },
+      async resume() { contextState = "running"; },
+      async suspend() { contextState = "suspended"; },
+      async close() { closeCalls += 1; contextState = "closed"; },
+      async decodeAudioData() { return { duration: 30 }; },
+      createGain() {
+        const node = { gain: { value: 1 }, connections: [], disconnected: false, connect(target) { node.connections.push(target); }, disconnect() { node.disconnected = true; } };
+        gainNodes.push(node);
+        return node;
+      },
+      createBufferSource() {
+        const node = { buffer: null, onended: null, connections: [], disconnected: false, connect(target) { node.connections.push(target); }, start() {}, stop() {}, disconnect() { node.disconnected = true; } };
+        sourceNodes.push(node);
+        return node;
+      }
+    };
+    const service = createAeroWebAudioService({ audioContext });
+    const defaults = service.getMixSnapshot();
+    const capability = service.getCapabilities().gainBuses;
+    const statusKeys = Object.keys(service.getStatus());
+    await service.load({ id: "browser-mix", kind: "array-buffer", label: "Browser Mix", arrayBuffer: new Uint8Array([1, 2, 3]).buffer });
+    await service.play();
+    currentTime = 3;
+    const clockBeforeMix = service.getClockSnapshot().positionSeconds;
+    const applied = service.setMix({ musicVolume: 0.25, sfxVolume: 0.75 });
+    const clockAfterMix = service.getClockSnapshot().positionSeconds;
+    await service.pause();
+    await service.seek(5);
+    await service.play();
+    let rejectedExtra = false;
+    try {
+      service.setMix(/** @type {import("../src/index.js").AudioMixSnapshot} */ ({ musicVolume: 0.5, sfxVolume: 0.5, extra: true }));
+    } catch {
+      rejectedExtra = true;
+    }
+    const beforeDestroy = {
+      gainValues: gainNodes.map(node => node.gain.value),
+      gainConnections: gainNodes.map(node => node.connections[0] === destination),
+      sourceRoutes: sourceNodes.map(node => node.connections[0] === gainNodes[0]),
+      sourceCount: sourceNodes.length,
+      clock: service.getClockSnapshot().positionSeconds
+    };
+    await service.destroy();
+    return {
+      defaults, capability, statusKeys, applied, clockBeforeMix, clockAfterMix, rejectedExtra, beforeDestroy,
+      gainDisconnected: gainNodes.map(node => node.disconnected), sourceDisconnected: sourceNodes.map(node => node.disconnected), closeCalls
+    };
+  }, "/src/index.js");
+  if (JSON.stringify(mixTopology.defaults) !== JSON.stringify({ musicVolume: 0.5, sfxVolume: 0.5 }) || !mixTopology.capability) {
+    throw new Error(`Browser mix defaults/capability failed: ${JSON.stringify(mixTopology)}`);
+  }
+  if (mixTopology.statusKeys.includes("musicVolume") || mixTopology.statusKeys.includes("sfxVolume") || !mixTopology.rejectedExtra) {
+    throw new Error(`Browser mix privacy/validation failed: ${JSON.stringify(mixTopology)}`);
+  }
+  if (mixTopology.clockBeforeMix !== 3 || mixTopology.clockAfterMix !== 3 || mixTopology.beforeDestroy.clock !== 5 || mixTopology.beforeDestroy.sourceCount !== 2) {
+    throw new Error(`Browser mix clock/source recreation failed: ${JSON.stringify(mixTopology)}`);
+  }
+  if (JSON.stringify(mixTopology.beforeDestroy.gainValues) !== JSON.stringify([0.25, 0.75]) || !mixTopology.beforeDestroy.gainConnections.every(Boolean) || !mixTopology.beforeDestroy.sourceRoutes.every(Boolean)) {
+    throw new Error(`Browser gain topology failed: ${JSON.stringify(mixTopology)}`);
+  }
+  if (!mixTopology.gainDisconnected.every(Boolean) || !mixTopology.sourceDisconnected.every(Boolean) || mixTopology.closeCalls !== 0) {
+    throw new Error(`Browser gain teardown failed: ${JSON.stringify(mixTopology)}`);
+  }
+  const realGain = await page.evaluate(async modulePath => {
+    const { createAeroWebAudioService } = /** @type {typeof import("../src/index.js")} */ (await import(modulePath));
+    const service = createAeroWebAudioService();
+    const evidence = {
+      supported: service.getStatus().supported,
+      gainBuses: service.getCapabilities().gainBuses,
+      applied: service.setMix({ musicVolume: 0, sfxVolume: 1 }),
+      statusKeys: Object.keys(service.getStatus())
+    };
+    await service.destroy();
+    return evidence;
+  }, "/src/index.js");
+  if (!realGain.supported || !realGain.gainBuses || JSON.stringify(realGain.applied) !== JSON.stringify({ musicVolume: 0, sfxVolume: 1 }) || realGain.statusKeys.includes("musicVolume") || realGain.statusKeys.includes("sfxVolume")) {
+    throw new Error(`Real browser GainNode/private mix proof failed: ${JSON.stringify(realGain)}`);
+  }
   if (consoleFailures.length > 0) {
     throw new Error(`Unexpected browser console output:\n${consoleFailures.join("\n")}`);
   }
-  console.log("Browser audio lifecycle and console-noise checks passed.");
+  console.log("Browser audio gain topology, strict private mix, lifecycle, ownership, and console-noise checks passed.");
 } finally {
   await browser.close();
   await new Promise(resolveClose => server.close(resolveClose));

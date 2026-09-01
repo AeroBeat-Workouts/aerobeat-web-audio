@@ -26,6 +26,47 @@ test("audio facade reports unsupported without a browser AudioContext", () => {
   assert.equal(service.getStatus().supported, false);
   assert.equal(service.getStatus().autoplayState, "unavailable");
   assert.equal(service.getCapabilities().webAudio, false);
+  assert.equal(service.getCapabilities().gainBuses, false);
+  assert.deepEqual(service.getMixSnapshot(), { musicVolume: 0.5, sfxVolume: 0.5 });
+  assert.equal("musicVolume" in service.getStatus(), false);
+  assert.equal("sfxVolume" in service.getStatus(), false);
+});
+
+test("mix API accepts only exact bounded own data values and remains private on unsupported contexts", () => {
+  const service = createAeroWebAudioService({ audioContextFactory: () => undefined });
+  const defaults = service.getMixSnapshot();
+  assert.deepEqual(defaults, { musicVolume: 0.5, sfxVolume: 0.5 });
+  assert.equal(Object.isFrozen(defaults), true);
+  const nullPrototype = Object.assign(Object.create(null), { musicVolume: 0, sfxVolume: 1 });
+  assert.deepEqual(service.setMix(nullPrototype), { musicVolume: 0, sfxVolume: 1 });
+  assert.deepEqual(service.getMixSnapshot(), { musicVolume: 0, sfxVolume: 1 });
+
+  const accessor = Object.defineProperties({}, {
+    musicVolume: { enumerable: true, get: () => 0.5 },
+    sfxVolume: { enumerable: true, value: 0.5 }
+  });
+  const nonEnumerable = Object.defineProperties({}, {
+    musicVolume: { enumerable: false, value: 0.5 },
+    sfxVolume: { enumerable: true, value: 0.5 }
+  });
+  const symbolExtra = { musicVolume: 0.5, sfxVolume: 0.5, [Symbol("private")]: true };
+  const inherited = Object.assign(Object.create({ inherited: true }), { musicVolume: 0.5, sfxVolume: 0.5 });
+  /** @type {unknown[]} */
+  const invalidShape = [undefined, null, "0.5", () => undefined, [], { musicVolume: 0.5 }, { musicVolume: 0.5, sfxVolume: 0.5, extra: true }, accessor, nonEnumerable, symbolExtra, inherited];
+  for (const value of invalidShape) {
+    assert.throws(() => service.setMix(/** @type {import("@aerobeat/web-audio").AudioMixSnapshot} */ (value)), TypeError);
+  }
+  for (const value of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+    assert.throws(() => service.setMix({ musicVolume: value, sfxVolume: 0.5 }), TypeError);
+    assert.throws(() => service.setMix({ musicVolume: 0.5, sfxVolume: value }), TypeError);
+  }
+  for (const value of [-0.01, 1.01]) {
+    assert.throws(() => service.setMix({ musicVolume: value, sfxVolume: 0.5 }), RangeError);
+    assert.throws(() => service.setMix({ musicVolume: 0.5, sfxVolume: value }), RangeError);
+  }
+  assert.deepEqual(service.getMixSnapshot(), { musicVolume: 0, sfxVolume: 1 }, "rejected mixes cannot mutate state");
+  assert.equal("musicVolume" in service.getStatus(), false);
+  assert.equal("sfxVolume" in service.getStatus(), false);
 });
 
 test("source descriptors support URL, object URL, Blob, ArrayBuffer, and generated silence without extension codec guesses", () => {
@@ -81,6 +122,72 @@ test("audio facade decodes bytes and preserves clock continuity through play, pa
   assert.equal(service.getStatus().state, "stopped");
 });
 
+test("Music and reserved SFX buses apply immediately and route every recreated source without clock jumps", async () => {
+  const audioContext = createFakeAudioContext({ decodedDurationSeconds: 60 });
+  const service = createAeroWebAudioService({ audioContext });
+  assert.equal(service.getCapabilities().gainBuses, true);
+  assert.equal(audioContext.createdGainNodes.length, 2);
+  const [musicBus, sfxBus] = audioContext.createdGainNodes;
+  assert.equal(musicBus?.gain.value, 0.5);
+  assert.equal(sfxBus?.gain.value, 0.5);
+  assert.deepEqual(musicBus?.connections, [audioContext.destination]);
+  assert.deepEqual(sfxBus?.connections, [audioContext.destination], "future-SFX bus is reserved and connected once");
+
+  await service.load(createArrayBufferSource("mix-song"));
+  await service.play();
+  audioContext.advance(2.25);
+  const beforeMix = service.getClockSnapshot();
+  assert.equal(audioContext.createdNodes[0]?.connections[0], musicBus);
+  assert.deepEqual(service.setMix({ musicVolume: 0.25, sfxVolume: 0.75 }), { musicVolume: 0.25, sfxVolume: 0.75 });
+  assert.equal(musicBus?.gain.value, 0.25);
+  assert.equal(sfxBus?.gain.value, 0.75);
+  assert.deepEqual(service.getClockSnapshot(), beforeMix, "gain changes cannot restart or jump the authoritative clock");
+  assert.equal(audioContext.createdNodes.length, 1, "gain update cannot recreate a source");
+
+  await service.pause();
+  await service.seek(10);
+  await service.play();
+  assert.equal(audioContext.createdNodes.length, 2);
+  assert.equal(audioContext.createdNodes[1]?.connections[0], musicBus, "seek/pause/resume recreation reuses the Music bus");
+  assert.equal(audioContext.createdGainNodes.length, 2, "gain buses are created once per service");
+  assert.equal(service.getClockSnapshot().positionSeconds, 10);
+
+  await service.destroy();
+  assert.equal(musicBus?.disconnected, true);
+  assert.equal(sfxBus?.disconnected, true);
+  assert.equal(musicBus?.disconnectCalls, 1);
+  assert.equal(sfxBus?.disconnectCalls, 1);
+  assert.equal(audioContext.closeCalls, 0, "caller-owned context remains open");
+  await service.destroy();
+  assert.equal(musicBus?.disconnectCalls, 1, "repeated destroy cannot disconnect buses twice");
+  assert.throws(() => service.setMix({ musicVolume: 0.5, sfxVolume: 0.5 }), /destroyed/u);
+  assert.deepEqual(service.getMixSnapshot(), { musicVolume: 0.25, sfxVolume: 0.75 });
+});
+
+test("gain-unavailable contexts retain direct playback and private mix truth", async () => {
+  const audioContext = createFakeAudioContext({ decodedDurationSeconds: 30, gainSupport: false });
+  const service = createAeroWebAudioService({ audioContext });
+  assert.equal(service.getCapabilities().gainBuses, false);
+  assert.equal(audioContext.createdGainNodes.length, 0);
+  assert.deepEqual(service.setMix({ musicVolume: 0.1, sfxVolume: 0.9 }), { musicVolume: 0.1, sfxVolume: 0.9 });
+  await service.load(createArrayBufferSource("fallback-mix"));
+  await service.play();
+  assert.equal(audioContext.createdNodes[0]?.connections[0], audioContext.destination, "fallback preserves direct playback topology");
+  assert.equal("musicVolume" in service.getStatus(), false);
+  assert.equal("sfxVolume" in service.getStatus(), false);
+});
+
+test("gain initialization failure disconnects partial buses and preserves direct playback", async () => {
+  const audioContext = createFakeAudioContext({ decodedDurationSeconds: 30, gainConnectError: new Error("gain connect failed") });
+  const service = createAeroWebAudioService({ audioContext });
+  assert.equal(service.getCapabilities().gainBuses, false);
+  assert.equal(audioContext.createdGainNodes.length, 2);
+  assert.ok(audioContext.createdGainNodes.every(node => node.disconnected));
+  await service.load(createArrayBufferSource("failed-gain-init"));
+  await service.play();
+  assert.equal(audioContext.createdNodes[0]?.connections[0], audioContext.destination);
+});
+
 test("visibility pause and resume retains decoded buffers and exact clock position", async () => {
   const audioContext = createFakeAudioContext({ decodedDurationSeconds: 90 });
   const visibility = createFakeVisibilityTarget(false);
@@ -103,6 +210,8 @@ test("visibility pause and resume retains decoded buffers and exact clock positi
   audioContext.advance(2);
   assert.equal(service.getClockSnapshot().positionSeconds, 6);
   assert.equal(audioContext.decodeCalls, 1, "visibility resume must retain the decoded buffer");
+  assert.equal(audioContext.createdNodes.length, 2);
+  assert.ok(audioContext.createdNodes.every(node => node.connections[0] === audioContext.createdGainNodes[0]), "visibility recreation must reuse the Music bus");
 });
 
 test("lease pause, activation, and release do not own cross-instance arbitration", async () => {
@@ -120,6 +229,8 @@ test("lease pause, activation, and release do not own cross-instance arbitration
   await service.activateLease();
   assert.equal(service.getStatus().leaseState, "active");
   assert.equal(service.getStatus().state, "playing");
+  assert.equal(audioContext.createdNodes.length, 2);
+  assert.ok(audioContext.createdNodes.every(node => node.connections[0] === audioContext.createdGainNodes[0]), "lease recreation must reuse the Music bus");
 
   await service.releaseLease();
   assert.equal(service.getStatus().leaseState, "released");
@@ -512,6 +623,9 @@ test("per-instance services isolate clocks, nodes, sources, and teardown", async
   const secondContext = createFakeAudioContext({ decodedDurationSeconds: 60 });
   const first = createAeroWebAudioService({ audioContext: firstContext });
   const second = createAeroWebAudioService({ audioContext: secondContext });
+  first.setMix({ musicVolume: 0.2, sfxVolume: 0.8 });
+  assert.deepEqual(second.getMixSnapshot(), { musicVolume: 0.5, sfxVolume: 0.5 });
+  assert.notEqual(firstContext.createdGainNodes[0], secondContext.createdGainNodes[0]);
   await first.load(createArrayBufferSource("first"));
   await second.load(createArrayBufferSource("second"));
   await first.play();
@@ -523,6 +637,8 @@ test("per-instance services isolate clocks, nodes, sources, and teardown", async
   assert.equal(second.getSource()?.id, "second");
   await first.destroy();
   assert.equal(first.getStatus().state, "destroyed");
+  assert.ok(firstContext.createdGainNodes.every(node => node.disconnected));
+  assert.ok(secondContext.createdGainNodes.every(node => !node.disconnected));
   assert.equal(second.getStatus().state, "ready");
   assert.equal(secondContext.createdNodes.length, 0);
 });
@@ -603,6 +719,7 @@ test("destroy aborts late decode, disconnects nodes, removes listeners, and clos
   assert.equal(destroyed.status.state, "destroyed");
   assert.equal(stale.stale, true);
   assert.equal(ownedContext.closeCalls, 1);
+  assert.ok(ownedContext.createdGainNodes.every(node => node.disconnected));
   assert.equal(visibility.listenerCount(), 0);
   assert.equal((await service.destroy()).status.state, "destroyed");
   assert.equal(ownedContext.closeCalls, 1);
@@ -667,6 +784,7 @@ function createUrlSource(id, url) {
  * @typedef {import("@aerobeat/web-audio").AudioContextAdapter & {
  *   advance: (seconds: number) => void,
  *   createdNodes: FakeBufferSource[],
+ *   createdGainNodes: FakeGainNode[],
  *   decodeCalls: number,
  *   closeCalls: number
  * }} FakeAudioContext
@@ -679,12 +797,21 @@ function createUrlSource(id, url) {
  *   disconnected: boolean,
  *   stopCalls: number,
  *   disconnectCalls: number,
- *   offset: number
+ *   offset: number,
+ *   connections: unknown[]
  * }} FakeBufferSource
  */
 
 /**
- * @param {{ decodedDurationSeconds?: number, resumeError?: Error, resumeDeferred?: ReturnType<typeof createDeferredVoid>, suspendDeferred?: ReturnType<typeof createDeferredVoid>, decodeError?: Error, decodeDeferred?: ReturnType<typeof createDeferredDecode>, createNodeError?: Error, connectError?: Error, startError?: Error }} [options]
+ * @typedef {import("@aerobeat/web-audio").AudioGainNodeAdapter & {
+ *   disconnected: boolean,
+ *   disconnectCalls: number,
+ *   connections: unknown[]
+ * }} FakeGainNode
+ */
+
+/**
+ * @param {{ decodedDurationSeconds?: number, resumeError?: Error, resumeDeferred?: ReturnType<typeof createDeferredVoid>, suspendDeferred?: ReturnType<typeof createDeferredVoid>, decodeError?: Error, decodeDeferred?: ReturnType<typeof createDeferredDecode>, createNodeError?: Error, connectError?: Error, startError?: Error, gainSupport?: boolean, gainCreateError?: Error, gainConnectError?: Error }} [options]
  * @returns {FakeAudioContext}
  */
 function createFakeAudioContext(options = {}) {
@@ -694,7 +821,10 @@ function createFakeAudioContext(options = {}) {
   let closeCalls = 0;
   /** @type {FakeBufferSource[]} */
   const createdNodes = [];
-  return {
+  /** @type {FakeGainNode[]} */
+  const createdGainNodes = [];
+  /** @type {FakeAudioContext} */
+  const context = {
     destination: Object.freeze({ id: "destination" }),
     get currentTime() {
       return currentTime;
@@ -704,6 +834,9 @@ function createFakeAudioContext(options = {}) {
     },
     get createdNodes() {
       return createdNodes;
+    },
+    get createdGainNodes() {
+      return createdGainNodes;
     },
     get decodeCalls() {
       return decodeCalls;
@@ -754,10 +887,12 @@ function createFakeAudioContext(options = {}) {
         stopCalls: 0,
         disconnectCalls: 0,
         offset: 0,
-        connect() {
+        connections: [],
+        connect(destination) {
           if (options.connectError) {
             throw options.connectError;
           }
+          node.connections.push(destination);
         },
         start(_when = 0, offset = 0) {
           if (options.startError) {
@@ -778,10 +913,32 @@ function createFakeAudioContext(options = {}) {
       createdNodes.push(node);
       return node;
     },
+    createGain() {
+      if (options.gainCreateError) throw options.gainCreateError;
+      /** @type {FakeGainNode} */
+      const node = {
+        gain: { value: 1 },
+        disconnected: false,
+        disconnectCalls: 0,
+        connections: [],
+        connect(destination) {
+          if (options.gainConnectError) throw options.gainConnectError;
+          node.connections.push(destination);
+        },
+        disconnect() {
+          node.disconnectCalls += 1;
+          node.disconnected = true;
+        }
+      };
+      createdGainNodes.push(node);
+      return node;
+    },
     advance(seconds) {
       currentTime += seconds;
     }
   };
+  if (options.gainSupport === false) delete context.createGain;
+  return context;
 }
 
 /**

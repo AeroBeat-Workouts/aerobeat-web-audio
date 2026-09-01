@@ -30,11 +30,14 @@ export {
  * @typedef {import("./audio-service.js").AudioLeaseState} AudioLeaseState
  * @typedef {import("./audio-service.js").AudioErrorCode} AudioErrorCode
  * @typedef {import("./audio-service.js").AudioServiceError} AudioServiceError
+ * @typedef {import("./audio-service.js").AudioMixSnapshot} AudioMixSnapshot
  * @typedef {import("./audio-service.js").AudioServiceStatus} AudioServiceStatus
  * @typedef {import("./audio-service.js").AudioServiceCapabilities} AudioServiceCapabilities
  * @typedef {import("./audio-service.js").AudioOperationResult} AudioOperationResult
  * @typedef {import("./audio-service.js").AudioBufferAdapter} AudioBufferAdapter
  * @typedef {import("./audio-service.js").AudioBufferSourceNodeAdapter} AudioBufferSourceNodeAdapter
+ * @typedef {import("./audio-service.js").AudioParamAdapter} AudioParamAdapter
+ * @typedef {import("./audio-service.js").AudioGainNodeAdapter} AudioGainNodeAdapter
  * @typedef {import("./audio-service.js").AudioContextAdapter} AudioContextAdapter
  * @typedef {import("./audio-service.js").AudioVisibilityTarget} AudioVisibilityTarget
  * @typedef {import("./audio-service.js").AudioFetch} AudioFetch

@@ -15,6 +15,14 @@ import { createPlaybackClock, normalizePosition } from "./playback-clock.js";
 /** @typedef {"audio_fetch_failed" | "audio_fetch_http_error" | "audio_hash_unavailable" | "audio_hash_mismatch" | "audio_decode_unsupported" | "audio_decode_failed" | "audio_autoplay_blocked" | "audio_context_failed" | "audio_source_missing" | "audio_lease_inactive" | "audio_document_hidden" | "audio_operation_aborted" | "audio_destroyed"} AudioErrorCode */
 
 /**
+ * Bounded global mix values. SFX is reserved for future sources.
+ *
+ * @typedef {Object} AudioMixSnapshot
+ * @property {number} musicVolume Music bus gain from zero through one.
+ * @property {number} sfxVolume Future-SFX bus gain from zero through one.
+ */
+
+/**
  * @typedef {Object} AudioServiceError
  * @property {AudioErrorCode} code Stable machine-readable error code.
  * @property {string} message Human-readable diagnostic.
@@ -47,6 +55,7 @@ import { createPlaybackClock, normalizePosition } from "./playback-clock.js";
  * @property {boolean} hashVerification SHA-256 verification availability.
  * @property {boolean} visibilityLifecycle Visibility pause/resume support.
  * @property {boolean} leaseLifecycle Media-lease participation support.
+ * @property {boolean} gainBuses Service-owned Music and future-SFX gain-bus support.
  */
 
 /**
@@ -72,6 +81,18 @@ import { createPlaybackClock, normalizePosition } from "./playback-clock.js";
  */
 
 /**
+ * @typedef {Object} AudioParamAdapter
+ * @property {number} value Immediate scalar parameter value.
+ */
+
+/**
+ * @typedef {Object} AudioGainNodeAdapter
+ * @property {AudioParamAdapter} gain Gain scalar parameter.
+ * @property {(destination: unknown) => void} connect Connects to a destination.
+ * @property {() => void} disconnect Disconnects the node.
+ */
+
+/**
  * Minimal Web Audio context surface used by the service and deterministic tests.
  *
  * @typedef {Object} AudioContextAdapter
@@ -83,6 +104,7 @@ import { createPlaybackClock, normalizePosition } from "./playback-clock.js";
  * @property {() => Promise<void>} close Closes the audio context.
  * @property {(bytes: ArrayBuffer) => Promise<AudioBufferAdapter>} [decodeAudioData] Decodes encoded audio bytes.
  * @property {() => AudioBufferSourceNodeAdapter} [createBufferSource] Creates a one-shot decoded-buffer source.
+ * @property {() => AudioGainNodeAdapter} [createGain] Creates a service-owned gain bus.
  */
 
 /**
@@ -128,6 +150,8 @@ import { createPlaybackClock, normalizePosition } from "./playback-clock.js";
  * @property {() => AudioServiceStatus} getStatus Reads current lifecycle state.
  * @property {() => AudioServiceCapabilities} getCapabilities Reads immutable capability truth.
  * @property {() => AudioSourceDescriptor | undefined} getSource Reads loaded source metadata without encoded bytes.
+ * @property {() => AudioMixSnapshot} getMixSnapshot Reads immutable bounded Music/future-SFX gain values.
+ * @property {(mix: AudioMixSnapshot) => AudioMixSnapshot} setMix Applies an exact bounded Music/future-SFX mix without restarting playback.
  * @property {(source: AudioSourceDescriptorInput, options?: AudioLoadOptions) => Promise<AudioOperationResult>} load Loads and decodes a source.
  * @property {() => Promise<AudioOperationResult>} play Starts or resumes playback.
  * @property {() => Promise<AudioOperationResult>} pause Pauses playback.
@@ -185,6 +209,13 @@ export function createAeroWebAudioService(options = {}) {
   let loadController;
   /** @type {string | undefined} */
   let ownedObjectUrl;
+  let musicVolume = 0.5;
+  let sfxVolume = 0.5;
+  /** @type {AudioGainNodeAdapter | undefined} */
+  let musicGainNode;
+  /** @type {AudioGainNodeAdapter | undefined} */
+  let sfxGainNode;
+  const gainBusesReady = initializeGainBuses();
 
   const visibilityListener = () => {
     void setDocumentHidden(Boolean(visibilityTarget?.hidden));
@@ -200,7 +231,8 @@ export function createAeroWebAudioService(options = {}) {
     arrayBufferLoading: typeof ArrayBuffer !== "undefined",
     hashVerification: Boolean(hashBytes),
     visibilityLifecycle: true,
-    leaseLifecycle: true
+    leaseLifecycle: true,
+    gainBuses: gainBusesReady
   });
 
   return Object.freeze({
@@ -212,6 +244,8 @@ export function createAeroWebAudioService(options = {}) {
     getSource() {
       return source ? cloneSourceDescriptor(source) : undefined;
     },
+    getMixSnapshot,
+    setMix,
     load,
     play,
     pause,
@@ -244,6 +278,26 @@ export function createAeroWebAudioService(options = {}) {
       errorCode: error?.code,
       errorMessage: error?.message
     });
+  }
+
+  /** @returns {AudioMixSnapshot} */
+  function getMixSnapshot() {
+    return Object.freeze({ musicVolume, sfxVolume });
+  }
+
+  /**
+   * @param {AudioMixSnapshot} mix
+   * @returns {AudioMixSnapshot}
+   */
+  function setMix(mix) {
+    const normalized = normalizeAudioMix(mix);
+    if (destroyed) {
+      throw new Error("Audio service is destroyed");
+    }
+    musicVolume = normalized.musicVolume;
+    sfxVolume = normalized.sfxVolume;
+    applyMixToGainBuses();
+    return getMixSnapshot();
   }
 
   /**
@@ -595,6 +649,7 @@ export function createAeroWebAudioService(options = {}) {
     loadController = undefined;
     visibilityTarget?.removeEventListener("visibilitychange", visibilityListener);
     stopPlaybackNode();
+    disconnectGainBuses();
     revokeOwnedObjectUrl();
     decodedBuffer = undefined;
     source = undefined;
@@ -707,8 +762,9 @@ export function createAeroWebAudioService(options = {}) {
       state = "stopped";
     };
     try {
-      if (audioContext.destination !== undefined) {
-        node.connect(audioContext.destination);
+      const playbackDestination = musicGainNode ?? audioContext.destination;
+      if (playbackDestination !== undefined) {
+        node.connect(playbackDestination);
       }
       node.start(0, offsetSeconds);
     } catch (cause) {
@@ -745,6 +801,56 @@ export function createAeroWebAudioService(options = {}) {
       node.disconnect();
     } catch {
       // Disconnect is idempotent across supported browser adapters.
+    }
+  }
+
+  /** @returns {boolean} */
+  function initializeGainBuses() {
+    if (!audioContext?.createGain || audioContext.destination === undefined) {
+      return false;
+    }
+    /** @type {AudioGainNodeAdapter | undefined} */
+    let nextMusic;
+    /** @type {AudioGainNodeAdapter | undefined} */
+    let nextSfx;
+    try {
+      nextMusic = audioContext.createGain();
+      nextSfx = audioContext.createGain();
+      nextMusic.gain.value = musicVolume;
+      nextSfx.gain.value = sfxVolume;
+      nextMusic.connect(audioContext.destination);
+      nextSfx.connect(audioContext.destination);
+      musicGainNode = nextMusic;
+      sfxGainNode = nextSfx;
+      return true;
+    } catch {
+      disconnectGainNode(nextMusic);
+      disconnectGainNode(nextSfx);
+      musicGainNode = undefined;
+      sfxGainNode = undefined;
+      return false;
+    }
+  }
+
+  function applyMixToGainBuses() {
+    if (musicGainNode) musicGainNode.gain.value = musicVolume;
+    if (sfxGainNode) sfxGainNode.gain.value = sfxVolume;
+  }
+
+  function disconnectGainBuses() {
+    disconnectGainNode(musicGainNode);
+    disconnectGainNode(sfxGainNode);
+    musicGainNode = undefined;
+    sfxGainNode = undefined;
+  }
+
+  /** @param {AudioGainNodeAdapter | undefined} node */
+  function disconnectGainNode(node) {
+    if (!node) return;
+    try {
+      node.disconnect();
+    } catch {
+      // Service-owned gain teardown is idempotent across browser adapters.
     }
   }
 
@@ -847,6 +953,38 @@ export function createAeroWebAudioService(options = {}) {
  */
 function createError(code, message) {
   return Object.freeze({ code, message });
+}
+
+/**
+ * @param {unknown} value
+ * @returns {AudioMixSnapshot}
+ */
+function normalizeAudioMix(value) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError("Audio mix must be a plain object with exactly musicVolume and sfxVolume");
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError("Audio mix must be a plain or null-prototype object");
+  }
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== 2 || !keys.includes("musicVolume") || !keys.includes("sfxVolume")) {
+    throw new TypeError("Audio mix must contain exactly musicVolume and sfxVolume");
+  }
+  const musicDescriptor = Object.getOwnPropertyDescriptor(value, "musicVolume");
+  const sfxDescriptor = Object.getOwnPropertyDescriptor(value, "sfxVolume");
+  if (!musicDescriptor?.enumerable || !("value" in musicDescriptor) || !sfxDescriptor?.enumerable || !("value" in sfxDescriptor)) {
+    throw new TypeError("Audio mix volumes must be own enumerable data values");
+  }
+  const musicVolume = musicDescriptor.value;
+  const sfxVolume = sfxDescriptor.value;
+  if (typeof musicVolume !== "number" || !Number.isFinite(musicVolume) || typeof sfxVolume !== "number" || !Number.isFinite(sfxVolume)) {
+    throw new TypeError("Audio mix volumes must be finite numbers");
+  }
+  if (musicVolume < 0 || musicVolume > 1 || sfxVolume < 0 || sfxVolume > 1) {
+    throw new RangeError("Audio mix volumes must be within zero and one inclusive");
+  }
+  return Object.freeze({ musicVolume, sfxVolume });
 }
 
 /**
