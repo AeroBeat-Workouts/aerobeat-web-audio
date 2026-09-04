@@ -3,6 +3,7 @@
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize, relative, resolve } from "node:path";
+import { networkInterfaces } from "node:os";
 import { chromium } from "playwright";
 
 const root = resolve(".");
@@ -25,7 +26,7 @@ const server = createServer(async (request, response) => {
 
 await new Promise((resolveListen, rejectListen) => {
   server.once("error", rejectListen);
-  server.listen(0, "127.0.0.1", () => resolveListen(undefined));
+  server.listen(0, "0.0.0.0", () => resolveListen(undefined));
 });
 
 const address = server.address();
@@ -235,6 +236,16 @@ try {
   if (!realGain.supported || !realGain.gainBuses || !realGain.frozen || realGain.createdGainCount !== 2 || JSON.stringify(realGain.defaults) !== JSON.stringify({ musicVolume: 0.5, sfxVolume: 0.5 }) || JSON.stringify(realGain.initialGainValues) !== JSON.stringify([0.5, 0.5]) || JSON.stringify(realGain.applied) !== JSON.stringify({ musicVolume: 0, sfxVolume: 1 }) || JSON.stringify(realGain.appliedGainValues) !== JSON.stringify([0, 1]) || !realGain.gainConnections.every(connections => connections.length === 1 && connections[0]) || realGain.gainDisconnectCalls.some(calls => calls !== 1) || realGain.callerContextState === "closed" || realGain.statusKeys.includes("musicVolume") || realGain.statusKeys.includes("sfxVolume")) {
     throw new Error(`Real browser GainNode/private mix proof failed: ${JSON.stringify(realGain)}`);
   }
+  await verifyDefaultHash(page, true);
+  const insecureHost = nonLoopbackIpv4();
+  if (!insecureHost) throw new Error("A genuine non-loopback Tailscale IPv4 address is required for insecure-context browser verification");
+  const insecurePage = await browser.newPage();
+  insecurePage.on("console", message => { if (message.type() === "warning" || message.type() === "error") consoleFailures.push(`${message.type()}: ${message.text()}`); });
+  insecurePage.on("pageerror", pageError => consoleFailures.push(`pageerror: ${pageError.message}`));
+  try {
+    await insecurePage.goto(`http://${insecureHost}:${address.port}/.testbed/demo/index.html`, { waitUntil: "networkidle" });
+    await verifyDefaultHash(insecurePage, false);
+  } finally { await insecurePage.close(); }
   if (consoleFailures.length > 0) {
     throw new Error(`Unexpected browser console output:\n${consoleFailures.join("\n")}`);
   }
@@ -242,6 +253,62 @@ try {
 } finally {
   await browser.close();
   await new Promise(resolveClose => server.close(resolveClose));
+}
+
+/** @param {import("playwright").Page} page @param {boolean} secure */
+async function verifyDefaultHash(page, secure) {
+  const evidence = await page.evaluate(async modulePath => {
+    const { createAeroWebAudioService } = /** @type {typeof import("../src/index.js")} */ (await import(modulePath));
+    const expected = "039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81";
+    const makeContext = () => ({ currentTime: 0, state: "running", async resume() {}, async suspend() {}, async close() {}, async decodeAudioData() { return { duration: 1 }; } });
+    const backing = new Uint8Array([99, 98, 1, 2, 3, 97]);
+    const visible = backing.subarray(2, 5);
+    /** @type {import("../src/index.js").AudioSourceDescriptorInput} */
+    const source = { id: "encoded", kind: "blob", label: "Encoded", blob: new Blob([visible]), expectedHash: { algorithm: "SHA-256", value: expected } };
+    const verified = createAeroWebAudioService({ audioContext: makeContext() });
+    const verifiedResult = await verified.load(source);
+    const tampered = createAeroWebAudioService({ audioContext: makeContext() });
+    const mismatchResult = await tampered.load({ ...source, blob: new Blob([new Uint8Array([1, 2, 4])]) });
+    const disabled = createAeroWebAudioService({ audioContext: makeContext(), hashBytes: null });
+    const disabledResult = await disabled.load(source);
+    let injectedCalls = 0;
+    let injectedAlgorithm = "";
+    let injectedBytes = "";
+    const injected = createAeroWebAudioService({ audioContext: makeContext(), hashBytes: async (bytes, algorithm) => {
+      injectedCalls += 1;
+      injectedAlgorithm = algorithm;
+      injectedBytes = Array.from(new Uint8Array(bytes)).join(",");
+      return expected;
+    } });
+    const injectedResult = await injected.load({ ...source, blob: new Blob([new Uint8Array([9, 9, 9])]) });
+    const result = {
+      isSecureContext,
+      subtleType: typeof globalThis.crypto?.subtle,
+      defaultCapability: verified.getCapabilities().hashVerification,
+      verifiedState: verifiedResult.status.state,
+      mismatchCode: mismatchResult.status.errorCode,
+      disabledCode: disabledResult.status.errorCode,
+      injectedState: injectedResult.status.state,
+      injectedCalls,
+      injectedAlgorithm,
+      injectedBytes
+    };
+    await Promise.all([verified.destroy(), tampered.destroy(), disabled.destroy(), injected.destroy()]);
+    return result;
+  }, "/src/index.js");
+  if (evidence.isSecureContext !== secure || evidence.subtleType !== (secure ? "object" : "undefined")) throw new Error(`Audio browser context assertion failed: ${JSON.stringify(evidence)}`);
+  if (!evidence.defaultCapability || evidence.verifiedState !== "ready" || evidence.mismatchCode !== "audio_hash_mismatch" || evidence.disabledCode !== "audio_hash_unavailable") throw new Error(`Audio default hash behavior failed: ${JSON.stringify(evidence)}`);
+  if (evidence.injectedState !== "ready" || evidence.injectedCalls !== 1 || evidence.injectedAlgorithm !== "SHA-256" || evidence.injectedBytes !== "9,9,9") throw new Error(`Audio injected hash semantics failed: ${JSON.stringify(evidence)}`);
+}
+
+function nonLoopbackIpv4() {
+  return Object.values(networkInterfaces()).flat().filter(entry => entry && entry.family === "IPv4" && !entry.internal).map(entry => entry.address).find(isTailscaleIpv4);
+}
+
+/** @param {string} value */
+function isTailscaleIpv4(value) {
+  const [first, second] = value.split(".").map(Number);
+  return first === 100 && second >= 64 && second <= 127;
 }
 
 /**

@@ -1,5 +1,6 @@
 // @ts-check
 
+import { sha256Hex } from "@aerobeat/web-hash";
 import { createAudioSourceDescriptor } from "./audio-source.js";
 import { createPlaybackClock, normalizePosition } from "./playback-clock.js";
 
@@ -1113,14 +1114,11 @@ function createBrowserFetch() {
   return (url, init) => globalThis.fetch(url, init);
 }
 
-/** @returns {AudioHashBytes | undefined} */
+/** @returns {AudioHashBytes} */
 function createBrowserHashBytes() {
-  if (!globalThis.crypto?.subtle) {
-    return undefined;
-  }
   return async (bytes, algorithm) => {
-    const digest = await globalThis.crypto.subtle.digest(algorithm, bytes);
-    return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
+    if (algorithm !== "SHA-256") throw new TypeError("Only SHA-256 audio integrity expectations are supported");
+    return sha256Hex(bytes);
   };
 }
 

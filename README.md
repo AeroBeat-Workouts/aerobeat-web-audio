@@ -34,7 +34,7 @@ The service supports `url`, `object-url`, `blob`, `array-buffer`, and determinis
 
 ### Source loading
 
-URL and object-URL inputs use CORS-mode fetch through an injectable adapter. Blob and ArrayBuffer inputs decode directly. An optional expected SHA-256 digest verifies encoded bytes before decode. Stable failures distinguish fetch/CORS, HTTP, unavailable hash support, hash mismatch, unsupported decode, decode failure, autoplay rejection, inactive lease, hidden document, cancellation, and destroyed lifecycle.
+URL and object-URL inputs use CORS-mode fetch through an injectable adapter. Blob and ArrayBuffer inputs decode directly. An optional expected SHA-256 digest verifies encoded bytes before decode. The default adapter uses `@aerobeat/web-hash` in automatic native/fallback mode, including genuine non-loopback insecure HTTP where `crypto.subtle` is absent; an injected adapter still replaces it, and explicit `hashBytes: null` still disables verification. Stable failures distinguish fetch/CORS, HTTP, genuinely unavailable or failed hashing, hash mismatch, unsupported decode, decode failure, autoplay rejection, inactive lease, hidden document, cancellation, and destroyed lifecycle.
 
 A file extension is provenance metadata, not a codec contract. In particular, `.egg` bytes are passed to `decodeAudioData`; unsupported encoding is reported as a decode failure rather than guessed from the extension.
 
@@ -68,6 +68,8 @@ Runtime code must not import gameplay, renderer, content-authoring, UI, assembly
 ## Testing and Injection
 
 The service accepts injected AudioContext, fetch, SHA-256, visibility, and object-URL adapters. Unit tests use deterministic fakes for load/play/pause/seek, visibility, lease transfer, autoplay rejection, CORS/HTTP/decode/hash failures, generation races, reconnect teardown, and clock continuity. Browser validation runs the package as native ESM in headless Chromium and fails on console warnings/errors.
+
+Browser coverage runs the real default encoded-byte verifier on secure localhost and genuine non-loopback Tailscale HTTP, first requiring `crypto.subtle` to be absent in the insecure row. It verifies an exact nonzero-offset byte view, one-byte mismatch failure, explicit-null disable behavior, injected-adapter replacement semantics, and teardown without console noise.
 
 Tests and scenes may import the package through the generated `.testbed/node_modules/@aerobeat/web-audio` self-link:
 
