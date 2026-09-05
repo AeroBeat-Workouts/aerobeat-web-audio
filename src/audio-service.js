@@ -621,7 +621,7 @@ export function createAeroWebAudioService(options = {}) {
     }
     resumeAfterLease = state === "playing";
     leaseState = "inactive";
-    await pauseInternal(source ? "paused" : "idle");
+    await pauseInternal(state === "stopped" ? "stopped" : source ? "paused" : "idle");
     return result(previousStatus, false);
   }
 
@@ -633,7 +633,7 @@ export function createAeroWebAudioService(options = {}) {
     }
     leaseState = "released";
     resumeAfterLease = false;
-    await pauseInternal(source ? "paused" : "idle");
+    await pauseInternal(state === "stopped" ? "stopped" : source ? "paused" : "idle");
     return result(previousStatus, false);
   }
 

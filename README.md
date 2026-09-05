@@ -47,7 +47,7 @@ A file extension is provenance metadata, not a codec contract. In particular, `.
 - `setDocumentHidden(true|false)` pauses and conditionally resumes the prior playing intent without discarding the decoded buffer.
 - `pauseForLease()` freezes playback while another game instance takes ownership.
 - `activateLease()` reacquires the lease and resumes preserved intent when visible.
-- `releaseLease()` pauses and clears automatic-resume intent.
+- `releaseLease()` pauses and clears automatic-resume intent; a naturally ended source remains truthfully `stopped` at duration while its lease is released.
 
 The service does not discover other instances or choose the active owner.
 

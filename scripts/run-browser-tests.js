@@ -158,12 +158,22 @@ try {
     } catch {
       rejectedExtra = true;
     }
+    sourceNodes.at(-1)?.onended?.();
+    const naturallyEnded = { state: service.getStatus().state, position: service.getClockSnapshot().positionSeconds };
+    await service.releaseLease();
+    const releasedEndedState = service.getStatus().state;
+    await service.activateLease();
+    await service.play();
+    const replayAtDuration = { state: service.getStatus().state, position: service.getClockSnapshot().positionSeconds };
     const beforeDestroy = {
       gainValues: gainNodes.map(node => node.gain.value),
       gainConnections: gainNodes.map(node => node.connections[0] === destination),
       sourceRoutes: sourceNodes.map(node => node.connections[0] === gainNodes[0]),
       sourceCount: sourceNodes.length,
-      clock: service.getClockSnapshot().positionSeconds
+      clock: service.getClockSnapshot().positionSeconds,
+      naturallyEnded,
+      releasedEndedState,
+      replayAtDuration
     };
     await service.destroy();
     return {
@@ -177,8 +187,8 @@ try {
   if (mixTopology.statusKeys.includes("musicVolume") || mixTopology.statusKeys.includes("sfxVolume") || !mixTopology.rejectedExtra) {
     throw new Error(`Browser mix privacy/validation failed: ${JSON.stringify(mixTopology)}`);
   }
-  if (mixTopology.clockBeforeMix !== 3 || mixTopology.clockAfterMix !== 3 || mixTopology.beforeDestroy.clock !== 5 || mixTopology.beforeDestroy.sourceCount !== 2) {
-    throw new Error(`Browser mix clock/source recreation failed: ${JSON.stringify(mixTopology)}`);
+  if (mixTopology.clockBeforeMix !== 3 || mixTopology.clockAfterMix !== 3 || mixTopology.beforeDestroy.clock !== 0 || mixTopology.beforeDestroy.sourceCount !== 3 || mixTopology.beforeDestroy.naturallyEnded.state !== "stopped" || mixTopology.beforeDestroy.naturallyEnded.position !== 30 || mixTopology.beforeDestroy.releasedEndedState !== "stopped" || mixTopology.beforeDestroy.replayAtDuration.state !== "playing" || mixTopology.beforeDestroy.replayAtDuration.position !== 0) {
+    throw new Error(`Browser mix clock/source recreation and terminal lease truth failed: ${JSON.stringify(mixTopology)}`);
   }
   if (JSON.stringify(mixTopology.beforeDestroy.gainValues) !== JSON.stringify([0.25, 0.75]) || !mixTopology.beforeDestroy.gainConnections.every(Boolean) || !mixTopology.beforeDestroy.sourceRoutes.every(Boolean)) {
     throw new Error(`Browser gain topology failed: ${JSON.stringify(mixTopology)}`);
